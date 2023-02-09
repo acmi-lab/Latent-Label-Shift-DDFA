@@ -1,7 +1,11 @@
+'''
+Implementation: Pranav Mani, Manley Roberts
+'''
 
 import numpy as np
 import torch
 from sklearn.utils import shuffle
+from datetime import datetime
 
 from .class_prior import *
 from .class_prior_estimation import *
@@ -14,7 +18,7 @@ from .domain_discriminator.domain_discriminator_scan import *
 from .permutation_solver import *
 
 class ExperimentSetup:
-    def __init__(self, dataset, domain_class_prior_matrix, domain_discriminator, class_prior_estimator, permutation_solver, device, batch_size):
+    def __init__(self, dataset, domain_class_prior_matrix, domain_discriminator, class_prior_estimator, permutation_solver, device, assignment_seed, batch_size, estimate_prior_valid_train=False, naive=False):
         self.dataset = dataset
         self.domain_class_prior_matrix = domain_class_prior_matrix
         self.domain_discriminator = domain_discriminator
@@ -22,6 +26,8 @@ class ExperimentSetup:
         self.permutation_solver = permutation_solver
         self.n_domains = self.domain_class_prior_matrix.n_domains
         self.n_classes = self.dataset.n_classes
+        self.estimate_prior_valid_train = estimate_prior_valid_train
+        self.naive = naive
 
         class_domain_assignment_matrix_train = self.domain_class_prior_matrix.class_domain_assignment_matrix_train
         class_domain_assignment_matrix_test  = self.domain_class_prior_matrix.class_domain_assignment_matrix_test
@@ -29,12 +35,15 @@ class ExperimentSetup:
 
         data_dims = self.dataset.data_dims
 
+        start_time = datetime.now()
+
         self.train_data, self.test_data, self.valid_data, self.train_labels, self.test_labels, self.valid_labels = self.format_data(
             class_domain_assignment_matrix_train,
             class_domain_assignment_matrix_test,
             class_domain_assignment_matrix_valid,
             data_dims,
-            batch_size
+            batch_size,
+            assignment_seed
         )
 
         self.train_labels = self.train_labels.to(device)
@@ -45,15 +54,17 @@ class ExperimentSetup:
         valid_domains = self.valid_labels[:,1]
         test_domains = self.test_labels[:,1]
 
+        self.train_domains = train_domains
+        self.valid_domains = valid_domains
+        self.test_domains = test_domains
+
         train_labels_only = self.train_labels[:,0]
         valid_labels_only = self.valid_labels[:,0]
         test_labels_only  = self.test_labels[:,0]
-
+        
         self.domain_discriminator.fit_discriminator(self.train_data, self.valid_data, train_domains, valid_domains)
 
-        # Pre-compute best possible acc, if it's available
-        if hasattr(self.domain_discriminator, 'baseline_acc'):
-            self.scan_alone_test_acc, self.scan_alone_reconstruction_error_L1, self.scan_reconstructed_p_y_given_d = self.domain_discriminator.baseline_acc(self.test_data, test_labels_only, test_domains, self.domain_class_prior_matrix.class_priors.T)
+        print(f'Run Elapsed: {datetime.now() - start_time}, fit discriminator')
 
         # Valid for clustering
         cluster_features_train = self.domain_discriminator.get_features(
@@ -62,13 +73,13 @@ class ExperimentSetup:
         cluster_features_valid = self.domain_discriminator.get_features(
            self.valid_data
         )
+        self.cluster_features_valid = cluster_features_valid
         cluster_features_valid_train = np.concatenate([cluster_features_valid, cluster_features_train], axis=0)
         cluster_features_test = self.domain_discriminator.get_features(
             self.test_data
         )
 
-
-        # self.true_test_classes = self.test_labels[:,0].cpu().numpy()
+        print(f'Run Elapsed: {datetime.now() - start_time}, extracted features')
 
         valid_domains = valid_domains.cpu().numpy()
         train_domains = train_domains.cpu().numpy()
@@ -76,37 +87,98 @@ class ExperimentSetup:
 
         domains_valid_train = np.concatenate([valid_domains, train_domains], axis=0)
 
-        # CLUSTER ON TRAIN + VALID
-        p_y_d = class_prior_estimator.estimate_class_prior(
-            n_classes=self.n_classes,
-            n_domains=self.n_domains,
-            input_data=cluster_features_valid_train,
-            input_domains=domains_valid_train)
+        if self.estimate_prior_valid_train:
+            # CLUSTER ON VALID+TRAIN
+            input_data = [self.valid_data, self.train_data]
 
-        p_d_x = cluster_features_test#.detach().cpu().numpy()
-        _, p_y_x = y_predictions_dd_uniform(p_d_x, p_y_d)
-        # domain adjusted
-        solved_dd_test_labels, p_y_x_d = y_predictions_dd_balanced(p_y_d, p_y_x, test_domains)
-        self.permuted_labels = self.permutation_solver.get_best_permutation(solved_dd_test_labels, test_labels_only.cpu().numpy())
-        self.test_post_cluster_acc = label_accuracy(self.permuted_labels, test_labels_only.cpu().numpy())
+            input_clustering_features = cluster_features_valid_train
+            input_domains = domains_valid_train
+        else:
+            # CLUSTER ON VALID
+            input_data = [self.valid_data]
 
-        predicted_class_prior = np.zeros_like(self.class_prior_estimator.p_y_given_d)
-        permuted_p_y_x_d = np.zeros_like(p_y_x_d)
-        best_class_ordering = self.permutation_solver.best_class_ordering                
-        for class_label, new_class_label in enumerate(best_class_ordering):
-            predicted_class_prior[new_class_label,:] = self.class_prior_estimator.p_y_given_d[class_label,:]
-            permuted_p_y_x_d[:, new_class_label] = p_y_x_d[:, class_label]
+            input_clustering_features = cluster_features_valid
+            input_domains = valid_domains
 
-        reconstruction_error_L1_balanced = np.sum(abs(self.domain_class_prior_matrix.class_priors.T - predicted_class_prior))
-        self.test_post_cluster_p_y_given_d_l1_norm = reconstruction_error_L1_balanced
+        if hasattr(self.domain_discriminator, 'baseline_acc'):
+            self.scan_alone_test_acc, self.scan_alone_reconstruction_error_L1, self.scan_reconstructed_p_y_given_d = self.domain_discriminator.baseline_acc(self.test_data, input_data, input_domains, self.domain_class_prior_matrix.class_priors.T)
 
-    def format_data(self, class_domain_assignment_matrix_train, class_domain_assignment_matrix_test, class_domain_assignment_matrix_valid, data_dims, batch_size):
-        train_data, train_labels = self.build_data_label_matrix(self.dataset.train_data, self.dataset.train_label_concatenate, class_domain_assignment_matrix_train, self.dataset.n_train, self.domain_class_prior_matrix.n_domains, data_dims, batch_size)
-        test_data, test_labels = self.build_data_label_matrix(self.dataset.test_data, self.dataset.test_label_concatenate, class_domain_assignment_matrix_test, self.dataset.n_test, self.domain_class_prior_matrix.n_domains, data_dims, batch_size)
-        valid_data, valid_labels = self.build_data_label_matrix(self.dataset.valid_data, self.dataset.valid_label_concatenate, class_domain_assignment_matrix_valid, self.dataset.n_valid, self.domain_class_prior_matrix.n_domains, data_dims, batch_size)
+        if class_prior_estimator is not None:
+
+            p_y_d = class_prior_estimator.estimate_class_prior(
+                n_classes=self.n_classes,
+                n_domains=self.n_domains,
+                input_data=input_clustering_features,
+                input_domains=input_domains
+            )
+
+            print(f'Run Elapsed: {datetime.now() - start_time}, estimated class prior')
+
+
+            if not naive:
+
+
+                p_d_x = cluster_features_test#.detach().cpu().numpy()
+                _, p_y_x = y_predictions_dd_uniform(p_d_x, p_y_d)
+                # domain adjusted
+                solved_dd_test_labels, p_y_x_d = y_predictions_dd_balanced(p_y_d, p_y_x, test_domains)
+                self.permuted_labels = self.permutation_solver.get_best_permutation(solved_dd_test_labels, test_labels_only.cpu().numpy())
+                self.test_post_cluster_acc = label_accuracy(self.permuted_labels, test_labels_only.cpu().numpy())
+
+                p_y_given_d_unpermuted = self.class_prior_estimator.p_y_given_d
+
+                predicted_class_prior = np.zeros_like(p_y_given_d_unpermuted)
+                permuted_p_y_x_d = np.zeros_like(p_y_x_d)
+                best_class_ordering = self.permutation_solver.best_class_ordering                
+                for class_label, new_class_label in enumerate(best_class_ordering):
+                    predicted_class_prior[new_class_label,:] = p_y_given_d_unpermuted[class_label,:]
+                    permuted_p_y_x_d[:, new_class_label] = p_y_x_d[:, class_label]
+
+                reconstruction_error_L1_balanced = np.sum(abs(self.domain_class_prior_matrix.class_priors.T - predicted_class_prior))
+                self.test_post_cluster_p_y_given_d_l1_norm = reconstruction_error_L1_balanced
+
+                print(f'Run Elapsed: {datetime.now() - start_time}, finished')
+            else:
+                # naive procedure
+
+                cluster_assignments = class_prior_estimator.base_cluster_model.eval_cluster(cluster_features_test, None)
+
+                m = class_prior_estimator.n_discretization
+
+                prediction_matrix = np.zeros((m, self.n_domains))
+
+                for c in range(m):
+                    for d in range(self.n_domains):
+                        prediction_matrix[c,d] = np.argmax(class_prior_estimator.p_discrete_x_given_y[c,:] * class_prior_estimator.p_y_given_d[:,d])
+
+                solved_dd_test_labels = np.array([ prediction_matrix[c,d] for c,d in zip(cluster_assignments, test_domains)])
+
+                self.permuted_labels = self.permutation_solver.get_best_permutation(solved_dd_test_labels, test_labels_only.cpu().numpy())
+                self.test_post_cluster_acc = label_accuracy(self.permuted_labels, test_labels_only.cpu().numpy())
+
+                p_y_given_d_unpermuted = self.class_prior_estimator.p_y_given_d
+                predicted_class_prior = np.zeros_like(p_y_given_d_unpermuted)
+                best_class_ordering = self.permutation_solver.best_class_ordering                
+                for class_label, new_class_label in enumerate(best_class_ordering):
+                    predicted_class_prior[new_class_label,:] = p_y_given_d_unpermuted[class_label,:]
+
+                reconstruction_error_L1_balanced = np.sum(abs(self.domain_class_prior_matrix.class_priors.T - predicted_class_prior))
+                self.test_post_cluster_p_y_given_d_l1_norm = reconstruction_error_L1_balanced
+
+
+    def format_data(self, class_domain_assignment_matrix_train, class_domain_assignment_matrix_test, class_domain_assignment_matrix_valid, data_dims, batch_size, assignment_seed):
+        
+        np.random.seed(assignment_seed)
+        build_seed_train = np.random.randint(1, 4_000_000_000)
+        build_seed_test = np.random.randint(1, 4_000_000_000)
+        build_seed_valid = np.random.randint(1, 4_000_000_000)
+
+        train_data, train_labels = self.build_data_label_matrix(self.dataset.train_data, self.dataset.train_label_concatenate, class_domain_assignment_matrix_train, self.dataset.n_train, self.domain_class_prior_matrix.n_domains, data_dims, batch_size, build_seed_train)
+        test_data, test_labels = self.build_data_label_matrix(self.dataset.test_data, self.dataset.test_label_concatenate, class_domain_assignment_matrix_test, self.dataset.n_test, self.domain_class_prior_matrix.n_domains, data_dims, batch_size, build_seed_test)
+        valid_data, valid_labels = self.build_data_label_matrix(self.dataset.valid_data, self.dataset.valid_label_concatenate, class_domain_assignment_matrix_valid, self.dataset.n_valid, self.domain_class_prior_matrix.n_domains, data_dims, batch_size, build_seed_valid)
         return train_data, test_data, valid_data, train_labels, test_labels, valid_labels
 
-    def build_data_label_matrix(self, dataset, label_concatenate, class_domain_assignment_matrix, n_data, n_domains, data_dims, batch_size):
+    def build_data_label_matrix(self, dataset, label_concatenate, class_domain_assignment_matrix, n_data, n_domains, data_dims, batch_size, build_seed):
         dims = [int(torch.sum(class_domain_assignment_matrix))] + list(data_dims)
         data = torch.zeros(*dims)
         labels = torch.zeros(int(torch.sum(class_domain_assignment_matrix)) , 2).long()
@@ -138,7 +210,7 @@ class ExperimentSetup:
         if labels.shape[0] > len(indices_list):
             labels = labels[:len(indices_list)]
         
-        indices_list, labels = shuffle(indices_list, labels)
+        indices_list, labels = shuffle(indices_list, labels, random_state=build_seed)
 
         dataset_subset = torch.utils.data.Subset(dataset, indices_list)
         data = torch.utils.data.DataLoader(dataset_subset, batch_size=batch_size, shuffle=False)

@@ -1,25 +1,38 @@
+'''
+Implementation: Pranav Mani, Manley Roberts
+'''
+
 import numpy as np
 from sklearn.decomposition import NMF
 
 from .clustering import *
 
 class ClassPriorEstimationTechnique:
+
+    def __init__(self, class_prior_estimation_seed=None):
+        self.class_prior_estimation_seed = class_prior_estimation_seed
+
     def get_hyperparameter_dict(self):
-        pass
+        return {
+            'name': get_name(self),
+            'class_prior_estimation_seed': self.class_prior_estimation_seed
+        }
 
     def estimate_class_prior(self, n_classes, n_domains, input_data, input_domains):
         pass
 
 class ClusterNMFClassPriorEstimation(ClassPriorEstimationTechnique):
-    def __init__(self, base_cluster_model, n_discretization):
+    def __init__(self, base_cluster_model, n_discretization, class_prior_estimation_seed=None):
         self.base_cluster_model = base_cluster_model
         self.n_discretization = n_discretization
+        self.class_prior_estimation_seed = class_prior_estimation_seed
 
     def get_hyperparameter_dict(self):
         return {
             'name': get_name(self),
             'base_params': self.base_cluster_model.get_hyperparameter_dict(),
-            'n_discretization': self.n_discretization
+            'n_discretization': self.n_discretization,
+            'class_prior_estimation_seed': self.class_prior_estimation_seed
         }
 
     def estimate_class_prior(self, n_classes, n_domains, input_data, input_domains):
@@ -36,7 +49,7 @@ class ClusterNMFClassPriorEstimation(ClassPriorEstimationTechnique):
 
         x_matrix = x_matrix / np.sum(x_matrix, axis=0, keepdims=True)
 
-        self.model = NMF(n_components=n_latents, init='random')
+        self.model = NMF(n_components=n_latents, init='random', random_state=self.class_prior_estimation_seed)
         
         W_new = self.model.fit_transform(x_matrix.T).T
         C_new = self.model.components_.T
@@ -56,3 +69,4 @@ class ClusterNMFClassPriorEstimation(ClassPriorEstimationTechnique):
         col_sums_C_vec = col_sums_C[0]
 
         return self.p_y_given_d
+        

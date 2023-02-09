@@ -1,21 +1,75 @@
-# Indicate the preferred GPU for experiments, or -1 for no GPU.
-gpu: 4
+# If we should run on wandb
+wandb:
+  use_wandb: True
+  entity:  ''
+  project: ''
+
+# path to save generated matrices to avoid needing to regen them
+save_path_generated_matrices: './generated_matrices/'
+
+# path to save csv file exported from wandb which provides templates by which to recover generated matrices if they are not present/available.
+template_file: 'prior_lookup.csv'
 
 datasets:
   cifar10:
     # Variants of CIFAR do not require you to download the zip yourself, just indicate a new root and they will automatically download
     root_path: '~/cifar10/'
+    classes: 10
+  cifar3:
+    # Variants of CIFAR do not require you to download the zip yourself, just indicate a new root and they will automatically download
+    root_path: '~/cifar10/'
+    classes: 3
   cifar20:
     root_path: '~/cifar100/'
+    classes: 20
   imagenet:
     # ImageNet50 must be downloaded on your own. Please indicate the root directory of the dataset.
     root_path: '~/imagenet/'
+    classes: 50
   fg2: 
     # FieldGuide2 must be installed on your own. Please indicate the root directory of the dataset.
     root_path: '~/fieldguide2/'
+    classes: 2
   fg28: 
     # FieldGuide28 must be installed on your own. Please indicate the root directory of the dataset.
     root_path: '~/fieldguide28/'
+    classes: 28
+
+# use flag --replace_experiments_with_paper_main <dataset_name> to replace other experiments with these specially-defined experiments
+paper_replication_experiments:
+  alphas: [0.5, 3, 10]
+  random_seed_waves:
+    0:
+      data_generation_seed:     [236648222, 479046732, 960276699, 750507101, 568466179]
+      model_stochasticity_seed: [664632, 798678, 234261, 7845, 12361]
+    1: 
+      data_generation_seed:     [4, 23, 623, 23423, 66]
+      model_stochasticity_seed: [9802394, 20342394, 1329582, 575, 2352]
+    2: 
+      data_generation_seed:     [268773, 9947296, 76383, 2234, 12839]
+      model_stochasticity_seed: [263417, 568546, 88798, 3467834, 875]
+    3: 
+      data_generation_seed:     [78496, 692, 7766739, 1112, 951]
+      model_stochasticity_seed: [252680230, 667896448, 428142901, 118636565, 253807063]
+    4: 
+      data_generation_seed:     [89234, 8847675, 123456786, 93939, 659256]
+      model_stochasticity_seed: [434007571, 580817424, 3717700, 957555157, 250683833]
+  datasets:
+    cifar10:
+      domains: [10,15,20,25]
+      max_condition_numbers: [4,4,8]
+    cifar20:
+      domains: [20,25,30]
+      max_condition_numbers: [8,12,20]
+    imagenet:
+      domains:  [50, 60]
+      max_condition_numbers: [200,205,210]   
+    fg2:
+      domains:  [10,7,5,3,2]
+      max_condition_numbers: [3,5,7]
+    fg28:
+      domains:  [47, 42, 37, 28]
+      max_condition_numbers: [12, 20, 28]
 
 # List of all experiments to conduct. If an experiment is commented out, it will not be conducted.
 # Note: this is not an exhaustive list of the experiments conducted in our paper.
@@ -23,7 +77,8 @@ datasets:
 experiments:
 - dataset_settings:
     dataset: 'cifar10'
-    dataset_split_seed: 7636
+    #7636
+
   class_prior_generation:
     # domains must be at least the number of classes
     domains: 10
@@ -31,60 +86,17 @@ experiments:
     alpha: 0.5
     # max cond must be positive. If it is too small, it is unlikely that a valid matrix could be generated.
     max_condition_number: 4
-    class_prior_seed: 4
-  approaches:
-  # options: ['ddfa', 'ddfa_scan']. If DDFA_SCAN is selected, the SCAN baseline will also be computed.
-  - 'ddfa'
-  - 'ddfa_scan'
-- dataset_settings:
-    dataset: 'cifar10'
-    dataset_split_seed: 7636
-  class_prior_generation:
-    # domains must be at least the number of classes
-    domains: 15
-    # alpha must be positive
-    alpha: 3
-    # max cond must be positive. If it is too small, it is unlikely that a valid matrix could be generated.
-    max_condition_number: 4
-    class_prior_seed: 4
-  approaches:
-  # options: ['ddfa', 'ddfa_scan']. If DDFA_SCAN is selected, the SCAN baseline will also be computed.
-  - 'ddfa'
-  - 'ddfa_scan'
-- dataset_settings:
-    dataset: 'cifar10'
-    dataset_split_seed: 25
-  class_prior_generation:
-    # domains must be at least the number of classes
-    domains: 15
-    # alpha must be positive
-    alpha: 10
-    # max cond must be positive. If it is too small, it is unlikely that a valid matrix could be generated.
-    max_condition_number: 8
-    class_prior_seed: 23
-  approaches:
-  # options: ['ddfa', 'ddfa_scan']. If DDFA_SCAN is selected, the SCAN baseline will also be computed.
-  - 'ddfa'
-  - 'ddfa_scan'
 
-# In our paper, we conducted experiments using the following setups:
-# cifar10: 
-#     Domain counts: [10,15,20,25]
-#     Pairs of (alpha, max_condition_number): [(0.5, 4), (3, 4), (10, 8)]
-#     Approaches: ['ddfa', 'ddfa_scan']
-# cifar20: 
-#     Domain counts: [20,25,30]
-#     Pairs of (alpha, max_condition_number): [(0.5, 8), (3, 12), (10, 20)]
-#     Approaches: ['ddfa', 'ddfa_scan']
-# imagenet: 
-#     Domain counts: [50,60]
-#     Pairs of (alpha, max_condition_number): [(0.5, 200), (3, 205), (10, 210)]
-#     Approaches: ['ddfa_scan']
-# fg2: 
-#     Domain counts: [2, 3, 5, 7, 10]
-#     Pairs of (alpha, max_condition_number): [(0.5, 3), (3, 5), (10, 7)]
-#     Approaches: ['ddfa_scan']
-# fg28:
-#     Domain counts: [28, 37, 42, 47]
-#     Pairs of (alpha, max_condition_number): [(0.5, 12), (3, 20), (10, 28)]
-#     Approaches: ['ddfa_scan']
+  class_prior_estimator: 'cluster_nmf'
+  data_generation_seed: 4
+  model_stochasticity_seed: 219
+
+  estimate_prior_valid_train: True
+  # if true, we'll use both valid and train data for clustering. If false, we'll use valid only.
+  retrain: False
+  # If true, we'll always retrain models. If false, we'll load models if they exist or retrain otherwise.
+
+  approaches:
+  # options: ['ddfa', 'ddfa_scan']. If DDFA_SCAN is selected, the SCAN baseline will also be computed.
+  # - 'ddfa'
+  - 'ddfa_scan'

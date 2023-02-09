@@ -29,8 +29,8 @@ SOFTWARE.
 ===========================================================================
 
 Certain code within ./ddfa/components/dataset.py, as well as ./ddfa/components/
-domain_discriminator/scan_model_definitions.py, and ./ddfa/components/domain_discriminator/models/resnet.py,
-is copied and modified from "SCAN: Learning to Classify Images without Labels"
+domain_discriminator/scan_model_definitions.py, and ./ddfa/components/domain_discriminator/models/resnet.py, as well as the scan pretrain checkpoints available in ./pretrain/.
+are copied and modified from "SCAN: Learning to Classify Images without Labels"
 by Wouter Van Gansbeke, Simon Vandenhende, Stamatios Georgoulis, Marc Proesmans and Luc Van Gool.
 
 "SCAN: Learning to Classify Images without Labels"

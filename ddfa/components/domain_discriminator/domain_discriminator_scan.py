@@ -3,12 +3,16 @@ Implementation: Pranav Mani, Manley Roberts
 '''
 
 import copy
+import os
 
 import torch
 from torch import nn
 import torchvision
 
 import numpy as np
+import random
+
+import wandb
 
 from .models.resnet import  *
 from .scan_model_definitions import *
@@ -16,9 +20,12 @@ from .domain_discriminator_interface import *
 
 from ..experiment_utils import *
 
+from sklearn.decomposition import PCA, FastICA
+
 class DomainDiscriminatorSCAN(DomainDiscriminator):
     
-    def __init__(self, device, lr, exp_lr_gamma, epochs, batch_size, n_classes, n_domains,load_path=None, eval_ps=None, class_prior=None, dropout=0, limit_gradient_flow=False, use_scheduler='ExponentialLR', baseline_load_path=None):
+    def __init__(self, device, dd_stochasticity_seed, lr, exp_lr_gamma, epochs, batch_size, n_classes, n_domains,load_path=None, eval_ps=None, class_prior=None, dropout=0, limit_gradient_flow=False, use_scheduler='ExponentialLR', baseline_load_path=None, weight_load_path=None, 
+                use_wandb = False):
         
         self.n_classes = n_classes
         self.n_domains = n_domains
@@ -32,6 +39,12 @@ class DomainDiscriminatorSCAN(DomainDiscriminator):
         self.dropout = dropout
         self.limit_gradient_flow = limit_gradient_flow
 
+        np.random.seed(dd_stochasticity_seed)
+        self.init_seed      = np.random.randint(1, 4_000_000_000)
+        self.training_seed  = np.random.randint(1, 4_000_000_000)
+
+        self.deterministic_seed(self.init_seed)
+
         self.model = self.build_model().to(device)
         self.epochs = epochs
         self.lr = lr
@@ -44,12 +57,25 @@ class DomainDiscriminatorSCAN(DomainDiscriminator):
         assert(use_scheduler in ['ReduceLROnPlateau' , 'ExponentialLR'])
         self.use_scheduler = use_scheduler
 
+        self.dd_stochasticity_seed = dd_stochasticity_seed
+
         self.baseline_load_path = baseline_load_path
+
+        if weight_load_path is not None and os.path.exists(weight_load_path):
+            saved_weights = torch.load(weight_load_path)
+            self.model.load_state_dict(saved_weights)
+            self.need_train = False
+        else:
+            self.need_train = True
+
+        self.use_wandb = use_wandb
+
+
 
     def build_model(self):
         pass
 
-    def baseline_acc(self, test_data, test_labels):
+    def baseline_acc(self, test_data, input_data, input_domains, true_p_y_d):
         pass
 
     def get_hyperparameter_dict(self):
@@ -64,113 +90,123 @@ class DomainDiscriminatorSCAN(DomainDiscriminator):
             'limit_gradient_flow' : self.limit_gradient_flow,
             'use_scheduler' : self.use_scheduler,
             'load_path': self.load_path,
-            'baseline_load_path': self.baseline_load_path
+            'baseline_load_path': self.baseline_load_path,
+            'dd_stochasticity_seed': self.dd_stochasticity_seed
         }
 
     def fit_discriminator(self, train_data, valid_data, train_domains, valid_domains):
 
-        loss_fn = nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        if self.need_train:
+            self.deterministic_seed(self.training_seed)
 
-        if(self.use_scheduler == 'ExponentialLR'):
-            scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=self.gamma)
-        elif(self.use_scheduler == 'ReduceLROnPlateau'):
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min',factor=0.01,patience=5)
+            loss_fn = nn.CrossEntropyLoss()
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
-        batch_size = self.batch_size
+            if(self.use_scheduler == 'ExponentialLR'):
+                scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=self.gamma)
+            elif(self.use_scheduler == 'ReduceLROnPlateau'):
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min',factor=0.01,patience=5)
 
-        self.model.train()
+            batch_size = self.batch_size
 
-        best_epoch = 0
-        best_model = None
-        best_valid_loss = None
-
-        for epoch in range(self.epochs):
             self.model.train()
 
-            n_correct = 0
-            sum_loss = 0
-            n_train = 0
-            batch_start = 0
-            for vec in train_data:
-                if isinstance(vec, dict):
-                    batch, _ = vec['image'], vec['target']
-                else:
-                    batch, _ = vec
+            best_epoch = 0
+            best_model = None
+            best_valid_loss = None
 
-                batch = batch.to(self.device)
-                labels = train_domains[batch_start:batch_start + batch_size]
+            self.valid_progress = []
 
-                optimizer.zero_grad()
-                logits = self.model(batch)
-                loss = loss_fn(logits, labels)
-                
-                sum_loss += loss.detach().cpu().numpy()
-                loss.backward()
-                optimizer.step()
+            for epoch in range(self.epochs):
+                self.model.train()
 
-                n_correct_batch = len(torch.nonzero(torch.argmax(logits, dim=1) == labels))
-                n_correct += n_correct_batch
-                n_train += batch.shape[0]
-                batch_start += batch.shape[0]
-            train_acc = n_correct / n_train
-            train_loss = sum_loss / n_train
+                n_correct = 0
+                sum_loss = 0
+                n_train = 0
+                batch_start = 0
+                for vec in train_data:
+                    if isinstance(vec, dict):
+                        batch, _ = vec['image'], vec['target']
+                    else:
+                        batch, _ = vec
 
-            self.model.eval()
+                    batch = batch.to(self.device)
+                    labels = train_domains[batch_start:batch_start + batch_size]
 
-            n_correct = 0
-            sum_loss = 0
-            n_valid = 0
-            batch_start = 0
-
-
-            for vec in valid_data:
-                if isinstance(vec, dict):
-                    batch, _ = vec['image'], vec['target']
-                else:
-                    batch, _ = vec
-
-                batch = batch.to(self.device)
-                labels = valid_domains[batch_start:batch_start + batch_size]
-
-                with torch.no_grad():
-
+                    optimizer.zero_grad()
                     logits = self.model(batch)
                     loss = loss_fn(logits, labels)
                     
                     sum_loss += loss.detach().cpu().numpy()
+                    loss.backward()
+                    optimizer.step()
 
-                n_correct_batch = len(torch.nonzero(torch.argmax(logits, dim=1) == labels))
+                    n_correct_batch = len(torch.nonzero(torch.argmax(logits, dim=1) == labels))
+                    n_correct += n_correct_batch
+                    n_train += batch.shape[0]
+                    batch_start += batch.shape[0]
+                train_acc = n_correct / n_train
+                train_loss = sum_loss / n_train
 
-                n_correct += n_correct_batch
-                n_valid += batch.shape[0]
-                batch_start += batch.shape[0]
-            valid_acc = n_correct / n_valid
-            valid_loss = sum_loss / n_valid
+                self.model.eval()
 
-            if(self.use_scheduler == 'ExponentialLR'):
-                scheduler.step()
-            elif(self.use_scheduler == 'ReduceLROnPlateau'):
-                scheduler.step(valid_loss) 
+                n_correct = 0
+                sum_loss = 0
+                n_valid = 0
+                batch_start = 0
 
-            if best_valid_loss is None or valid_loss < best_valid_loss:
-                best_epoch = epoch
-                best_model = copy.deepcopy(self.model)
-                best_valid_loss = valid_loss
-            
-            log_dict = {
-                'epoch':                                epoch,
-                'train_domain_discriminator_accuracy':  train_acc,
-                'train_domain_discriminator_loss':      train_loss,
-                'valid_domain_discriminator_accuracy':  valid_acc,
-                'valid_domain_discriminator_loss':      valid_loss,
-                'best_epoch':                           best_epoch,
-            }
+                for vec in valid_data:
+                    if isinstance(vec, dict):
+                        batch, _ = vec['image'], vec['target']
+                    else:
+                        batch, _ = vec
 
-            print(log_dict)
+                    batch = batch.to(self.device)
+                    labels = valid_domains[batch_start:batch_start + batch_size]
 
-        # Preserve best model on test dataset
-        self.model = best_model
+                    with torch.no_grad():
+
+                        logits = self.model(batch)
+                        loss = loss_fn(logits, labels)
+                        
+                        sum_loss += loss.detach().cpu().numpy()
+
+                    n_correct_batch = len(torch.nonzero(torch.argmax(logits, dim=1) == labels))
+
+                    n_correct += n_correct_batch
+                    n_valid += batch.shape[0]
+                    batch_start += batch.shape[0]
+                valid_acc = n_correct / n_valid
+                valid_loss = sum_loss / n_valid
+
+                self.valid_progress.append(self.get_features(valid_data))
+
+                if(self.use_scheduler == 'ExponentialLR'):
+                    scheduler.step()
+                elif(self.use_scheduler == 'ReduceLROnPlateau'):
+                    scheduler.step(valid_loss) 
+
+                if best_valid_loss is None or valid_loss < best_valid_loss:
+                    best_epoch = epoch
+                    best_model = copy.deepcopy(self.model)
+                    best_valid_loss = valid_loss
+                
+                log_dict = {
+                    'epoch':                                epoch,
+                    'train_domain_discriminator_accuracy':  train_acc,
+                    'train_domain_discriminator_loss':      train_loss,
+                    'valid_domain_discriminator_accuracy':  valid_acc,
+                    'valid_domain_discriminator_loss':      valid_loss,
+                    'best_epoch':                           best_epoch,
+                }
+
+                print(log_dict)
+
+                if self.use_wandb:
+                    wandb.log(log_dict)
+
+            # Preserve best model on test dataset
+            self.model = best_model
 
     def get_features(self, data):
         # batch_size = 32
@@ -197,7 +233,8 @@ class DomainDiscriminatorSCAN(DomainDiscriminator):
 
 
 class scan_pretext(DomainDiscriminatorSCAN):
-    def baseline_acc(self, test_data, test_labels, test_domains, true_p_y_d):
+    def baseline_acc(self, test_data, input_data, input_domains, true_p_y_d):
+
         load_path = self.baseline_load_path
         backbone = ResNet18_for_SCAN()
         model = ClusteringModel(backbone,nclusters=self.n_classes,nheads=1).to(self.device) 
@@ -205,8 +242,7 @@ class scan_pretext(DomainDiscriminatorSCAN):
         if 'model' in state_dict:
             state_dict = state_dict['model'] 
         model.load_state_dict(state_dict,strict=True)
-        scan_alone_test_acc, p_y_d_err, scan_p_y_d  = model_evaluate(model, test_data, true_p_y_d, self.eval_ps, self.device)
-
+        scan_alone_test_acc, p_y_d_err, scan_p_y_d  = model_evaluate(model, test_data, input_data, input_domains, true_p_y_d, self.eval_ps, self.device)
         return scan_alone_test_acc, p_y_d_err, scan_p_y_d
 
     def build_model(self):
@@ -241,23 +277,23 @@ class scan_pretext(DomainDiscriminatorSCAN):
 
 
 class scan_scan(DomainDiscriminatorSCAN):
-    def baseline_acc(self, test_data, test_labels, test_domains, true_p_y_d):
+    def baseline_acc(self, test_data, input_data, input_domains, true_p_y_d):
+
         load_path = self.baseline_load_path
         backbone = ResNet18_for_SCAN()
         model = ClusteringModel(backbone,nclusters=self.n_classes,nheads=1).to(self.device) 
         state_dict = torch.load(load_path)
         if 'model' in state_dict:
             state_dict = state_dict['model']
-        model.load_state_dict(state_dict, strict=False)
-        # model_dict = model.state_dict()
+        # model.load_state_dict(state_dict, strict=False)
 
         # # Fiter out unneccessary keys
-        # filtered_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
-        # model_dict.update(filtered_dict)
-        # model.load_state_dict(model_dict)
+        model_dict = model.state_dict()
+        filtered_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
+        model_dict.update(filtered_dict)
+        model.load_state_dict(model_dict, strict=False)
 
-        scan_alone_test_acc, p_y_d_err, scan_p_y_d  = model_evaluate(model, test_data, true_p_y_d, self.eval_ps, self.device)
-
+        scan_alone_test_acc, p_y_d_err, scan_p_y_d  = model_evaluate(model, test_data, input_data, input_domains, true_p_y_d, self.eval_ps, self.device)
         return scan_alone_test_acc, p_y_d_err, scan_p_y_d
 
     def build_model(self): 
@@ -292,8 +328,8 @@ class scan_scan(DomainDiscriminatorSCAN):
 
 
 class scan_scan_imagenet(DomainDiscriminatorSCAN):
-    def baseline_acc(self, test_data, test_labels, test_domains, true_p_y_d):
-        
+    def baseline_acc(self, test_data, input_data, input_domains, true_p_y_d):
+
         load_path = self.baseline_load_path
         obj  = torchvision.models.__dict__['resnet50']()
         obj.fc = nn.Identity()
@@ -303,7 +339,7 @@ class scan_scan_imagenet(DomainDiscriminatorSCAN):
         if 'model' in state_dict:
             state_dict = state_dict['model'] 
         missing = model.load_state_dict(state_dict,strict=False)
-        scan_alone_test_acc, p_y_d_err, scan_p_y_d  = model_evaluate(model, test_data, true_p_y_d, self.eval_ps, self.device)
+        scan_alone_test_acc, p_y_d_err, scan_p_y_d  = model_evaluate(model, test_data, input_data, input_domains, true_p_y_d, self.eval_ps, self.device)
 
         return scan_alone_test_acc, p_y_d_err, scan_p_y_d
 
@@ -339,5 +375,174 @@ class scan_scan_imagenet(DomainDiscriminatorSCAN):
                     for param in module.parameters():
                         param.requires_grad = False 
         return obj   
+
+class scan_scan_naive(DomainDiscriminator): 
+
+    def __init__(self, device, n_domains, n_classes, architecture, dd_stochasticity_seed, eval_ps, load_path=None,baseline_load_path=None):
+        self.device = device
+        self.n_domains = n_domains
+        self.n_classes = n_classes
+        self.load_path = load_path
+        self.baseline_load_path = baseline_load_path
+        assert architecture in ['scan_scan','scan_pretext','scan_imagenet'] 
+        self.architecture = architecture
+        self.eval_ps = eval_ps
+        np.random.seed(dd_stochasticity_seed)
+
+        self.init_seed = np.random.randint(1, 4_000_000_000)
+        self.deterministic_seed(self.init_seed)
+
+        self.model = self.build_model().to(device)
+    
+    def baseline_acc(self, test_data, input_data, input_domains, true_p_y_d):
+
+        if self.architecture == 'scan_scan':
+            load_path = self.baseline_load_path
+            backbone = ResNet18_for_SCAN()
+            model = ClusteringModel(backbone,nclusters=self.n_classes,nheads=1).to(self.device) 
+            state_dict = torch.load(load_path)
+            if 'model' in state_dict:
+                state_dict = state_dict['model']
+            model_dict = model.state_dict()
+            filtered_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
+            model_dict.update(filtered_dict)
+            model.load_state_dict(model_dict, strict=False)
+            scan_alone_test_acc, p_y_d_err, scan_p_y_d  = model_evaluate(model, test_data, input_data, input_domains, true_p_y_d, self.eval_ps, self.device)
+            return scan_alone_test_acc, p_y_d_err, scan_p_y_d
+
+        elif self.architecture == 'scan_imagenet': 
+            load_path = self.baseline_load_path
+            obj  = torchvision.models.__dict__['resnet50']()
+            obj.fc = nn.Identity()
+            backbone = {'backbone': obj, 'dim':2048}
+            model = ClusteringModel(backbone,nclusters=self.n_classes,nheads=1).to(self.device) 
+            state_dict = torch.load(load_path)
+            if 'model' in state_dict:
+                state_dict = state_dict['model'] 
+            missing = model.load_state_dict(state_dict,strict=False)
+            scan_alone_test_acc, p_y_d_err, scan_p_y_d  = model_evaluate(model, test_data, input_data, input_domains, true_p_y_d, self.eval_ps, self.device)
+            return scan_alone_test_acc, p_y_d_err, scan_p_y_d
+
+        elif self.architecture == 'scan_pretext':
+            load_path = self.baseline_load_path
+            backbone = ResNet18_for_SCAN()
+            model = ClusteringModel(backbone,nclusters=self.n_classes,nheads=1).to(self.device) 
+            state_dict = torch.load(load_path)
+            if 'model' in state_dict:
+                state_dict = state_dict['model'] 
+            model.load_state_dict(state_dict,strict=True)
+            scan_alone_test_acc, p_y_d_err, scan_p_y_d  = model_evaluate(model, test_data, input_data, input_domains, true_p_y_d, self.eval_ps, self.device)
+            return scan_alone_test_acc, p_y_d_err, scan_p_y_d
+
+
+    def build_model(self):
+
+        if self.architecture == 'scan_scan': 
+            # Same as the definition in scan_scan but with dropout and limit_gradient_flow conditions removed
+            num_classes = self.n_domains
+            obj =  ResNetwithInitialisations(BasicBlock,[2,2,2,2],num_classes=num_classes) 
+            
+            load_path = self.load_path
+            state_full = torch.load(load_path)
+            state_dict = state_full['model']
+            from collections import OrderedDict
+            renamed_state = OrderedDict()
+            for key in state_dict.keys(): 
+                renamed_state[key.replace('backbone.','')] = state_dict[key]
+
+            obj.load_state_dict(renamed_state,strict=False)
+
+            # cut off linear layer sending 512 -> n_classes
+            obj.linear = nn.Identity()
+
+            return obj 
+
+        # elif self.architecture == 'scan_pretext': 
+        #     num_classes = self.n_domains
+        #     obj = ResNetwithInitialisations(BasicBlockWithDropout,[2,2,2,2],num_classes=num_classes)
+                
+        #     load_path = self.load_path
+        #     state = torch.load(load_path)
+        #     from collections import OrderedDict
+        #     renamed_state = OrderedDict()
+        #     for key in state.keys(): 
+        #         renamed_state[key.replace('backbone.','')] = state[key] 
+            
+        #     obj.load_state_dict(renamed_state, strict=False)
+        #     return obj
+
+        # elif self.architecture == 'scan_imagenet':
+        #     num_classes = self.n_domains
+            
+        #     obj =  torchvision.models.__dict__['resnet50']()
+        #     obj.fc = nn.Linear(2048,num_classes,bias=True) 
+            
+        #     load_path = self.load_path
+        #     state_full = torch.load(load_path)
+        #     state_dict = state_full['model']
+        #     from collections import OrderedDict
+        #     renamed_state = OrderedDict()
+        #     for key in state_dict.keys(): 
+        #         renamed_state[key.replace('backbone.','')] = state_dict[key]
+
+        #     obj.load_state_dict(renamed_state,strict=False)
+
+        #     return obj    
+
+    def get_features(self, data):
+        # batch_size = 32
+        eval_probs_list =[]
+        softmax = nn.Softmax().to(self.device)
+        self.model.eval()
+        corr_labels = []
+        for vec in data:
+            if isinstance(vec, dict):
+                batch, _ = vec['image'], vec['target']
+            else:
+                batch, _ = vec
+            corr_labels.append(_)
+            batch = batch.to(self.device)
+            # batch = data[i:i+batch_size]
+            with torch.no_grad():
+                eval_logits = self.model(batch)
+                eval_probs = softmax(eval_logits).cpu().numpy()
+            eval_probs_list.append(eval_probs)
+
+        self.corr_labels = np.concatenate(corr_labels, axis=0)
+
+        return np.concatenate(eval_probs_list, axis=0)
+
+    def get_hyperparameter_dict(self):
+        return {
+            'name': get_name(self),
+            'n_domains': self.n_domains,
+            'load_path': self.load_path,
+            'baseline_load_path': self.baseline_load_path,
+            
+        }
+
+class scan_scan_naive_pca(scan_scan_naive): 
+    def get_features(self, data):
+        features = super().get_features(data)
+        dim_red_model = PCA(n_components=self.n_domains)
+        return dim_red_model.fit_transform(features).copy(order='C')
+
+class scan_scan_naive_ica(scan_scan_naive):
+    def get_features(self, data):
+        features = super().get_features(data)
+        dim_red_model = FastICA(n_components=self.n_domains) 
+        return dim_red_model.fit_transform(features).copy(order='C')
+
+    
+
+    
+        
+
+
+
+
+
+
+
 
         

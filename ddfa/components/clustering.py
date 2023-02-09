@@ -1,3 +1,7 @@
+'''
+Implementation: Pranav Mani, Manley Roberts
+'''
+
 import numpy as np
 from faiss import Kmeans
 
@@ -15,13 +19,15 @@ class ClusterModel:
             'name': get_name(self)
         }
 
+
 class ClusterModelFaissKMeans(ClusterModel):
-    def __init__(self, use_gpu=False):
+    def __init__(self, use_gpu=False, random_seed=None):
+        self.random_seed = random_seed
         self.use_gpu = use_gpu
 
     def train_cluster(self, n_classes, n_domains, input_data, input_domains):
 
-        self.model = Kmeans(d=input_data.shape[1], k=n_classes, niter=100, verbose=False, gpu=self.use_gpu, nredo=5)
+        self.model = Kmeans(d=input_data.shape[1], k=n_classes, niter=100, verbose=False, gpu=self.use_gpu, nredo=5, seed=self.random_seed % 1_000_000)
         self.model.train(input_data.astype(np.float32))
         
         centroid_distances, cluster_labels = self.model.index.search(input_data.astype(np.float32), 1)

@@ -3,11 +3,16 @@ Implementation: Pranav Mani, Manley Roberts
 '''
 
 import copy
+import os
 
 import torch
 from torch import nn
 
+import random
+
 import numpy as np
+
+import wandb
 
 from .models.resnet import BasicBlockWithDropout, ResNet
 from .domain_discriminator_interface import *
@@ -16,10 +21,21 @@ from ..experiment_utils import *
 
 class VanillaDomainDiscriminatorModel(DomainDiscriminator):
     
-    def __init__(self, device, lr, exp_lr_gamma, epochs, batch_size, n_classes, n_domains, eval_ps, class_prior):
+    def __init__(self, device, dd_stochasticity_seed, lr, exp_lr_gamma, epochs, batch_size, n_classes, n_domains, eval_ps, class_prior, weight_load_path=None, 
+                use_wandb = False):
         self.n_classes = n_classes
         self.n_domains = n_domains
+
+        np.random.seed(dd_stochasticity_seed)
+        self.init_seed      = np.random.randint(1, 4_000_000_000)
+        self.training_seed  = np.random.randint(1, 4_000_000_000)
+
+        self.deterministic_seed(self.init_seed)
+        
+
         self.model = self.build_model().to(device)
+        
+
         self.epochs = epochs
         self.lr = lr
         self.gamma = exp_lr_gamma
@@ -27,6 +43,17 @@ class VanillaDomainDiscriminatorModel(DomainDiscriminator):
         self.batch_size = batch_size
         self.eval_ps = eval_ps
         self.class_prior = class_prior
+        self.dd_stochasticity_seed = dd_stochasticity_seed
+
+        if weight_load_path is not None and os.path.exists(weight_load_path):
+            saved_weights = torch.load(weight_load_path)
+            self.model.load_state_dict(saved_weights)
+            self.need_train = False
+        else:
+            self.need_train = True
+
+        self.use_wandb = use_wandb
+
 
     def build_model(self):
         pass
@@ -38,104 +65,113 @@ class VanillaDomainDiscriminatorModel(DomainDiscriminator):
             'n_epochs': self.epochs,
             'lr': self.lr,
             'gamma': self.gamma,
-            'batch_size': self.batch_size
+            'batch_size': self.batch_size,
+            'dd_stochasticity_seed': self.dd_stochasticity_seed
         }
 
     def fit_discriminator(self, train_data, valid_data, train_domains, valid_domains):
-        loss_fn = nn.CrossEntropyLoss()
 
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=self.gamma)
+        if self.need_train:
+            self.deterministic_seed(self.training_seed)
+            
+            loss_fn = nn.CrossEntropyLoss()
+
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=self.gamma)
 
 
-        batch_size = self.batch_size
+            batch_size = self.batch_size
 
-        self.model.train()
-
-        best_epoch = 0
-        best_model = None
-        best_valid_loss = None
-
-        for epoch in range(self.epochs):
             self.model.train()
 
-            n_correct = 0
-            sum_loss = 0
-            n_train = 0
-            batch_start = 0
-            for vec in train_data:
-                if isinstance(vec, dict):
-                    batch, _ = vec['image'], vec['target']
-                else:
-                    batch, _ = vec
-                # batch = train_data[batch_start:batch_start + batch_size]
-                batch = batch.to(self.device)
-                labels = train_domains[batch_start:batch_start + batch_size]
+            best_epoch = 0
+            best_model = None
+            best_valid_loss = None
 
-                optimizer.zero_grad()
-                logits = self.model(batch)
-                loss = loss_fn(logits, labels)
-                
-                sum_loss += loss.detach().cpu().numpy()
-                loss.backward()
-                optimizer.step()
+            for epoch in range(self.epochs):
+                self.model.train()
 
-                n_correct_batch = len(torch.nonzero(torch.argmax(logits, dim=1) == labels))
-                n_correct += n_correct_batch
-                n_train += batch.shape[0]
-                batch_start += batch.shape[0]
-            train_acc = n_correct / n_train
-            train_loss = sum_loss / n_train
+                n_correct = 0
+                sum_loss = 0
+                n_train = 0
+                batch_start = 0
+                for vec in train_data:
+                    if isinstance(vec, dict):
+                        batch, _ = vec['image'], vec['target']
+                    else:
+                        batch, _ = vec
+                    # batch = train_data[batch_start:batch_start + batch_size]
+                    batch = batch.to(self.device)
+                    labels = train_domains[batch_start:batch_start + batch_size]
 
-            self.model.eval()
-
-            n_correct = 0
-            sum_loss = 0
-            n_valid = 0
-            batch_start = 0
-            for vec in valid_data:
-                if isinstance(vec, dict):
-                    batch, _ = vec['image'], vec['target']
-                else:
-                    batch, _ = vec
-                # batch = valid_data[batch_start:batch_start + batch_size]
-                batch = batch.to(self.device)
-                labels = valid_domains[batch_start:batch_start + batch_size]
-
-                with torch.no_grad():
-
+                    optimizer.zero_grad()
                     logits = self.model(batch)
                     loss = loss_fn(logits, labels)
                     
                     sum_loss += loss.detach().cpu().numpy()
+                    loss.backward()
+                    optimizer.step()
 
-                n_correct_batch = len(torch.nonzero(torch.argmax(logits, dim=1) == labels))
-                n_correct += n_correct_batch
-                n_valid += batch.shape[0]
-                batch_start += batch.shape[0]
-            valid_acc = n_correct / n_valid
-            valid_loss = sum_loss / n_valid
+                    n_correct_batch = len(torch.nonzero(torch.argmax(logits, dim=1) == labels))
+                    n_correct += n_correct_batch
+                    n_train += batch.shape[0]
+                    batch_start += batch.shape[0]
+                train_acc = n_correct / n_train
+                train_loss = sum_loss / n_train
 
-            if best_valid_loss is None or valid_loss < best_valid_loss:
-                best_epoch = epoch
-                best_model = copy.deepcopy(self.model)
-                best_valid_loss = valid_loss
+                self.model.eval()
+
+                n_correct = 0
+                sum_loss = 0
+                n_valid = 0
+                batch_start = 0
+                for vec in valid_data:
+                    if isinstance(vec, dict):
+                        batch, _ = vec['image'], vec['target']
+                    else:
+                        batch, _ = vec
+                    # batch = valid_data[batch_start:batch_start + batch_size]
+                    batch = batch.to(self.device)
+                    labels = valid_domains[batch_start:batch_start + batch_size]
+
+                    with torch.no_grad():
+
+                        logits = self.model(batch)
+                        loss = loss_fn(logits, labels)
+                        
+                        sum_loss += loss.detach().cpu().numpy()
+
+                    n_correct_batch = len(torch.nonzero(torch.argmax(logits, dim=1) == labels))
+                    n_correct += n_correct_batch
+                    n_valid += batch.shape[0]
+                    batch_start += batch.shape[0]
+                valid_acc = n_correct / n_valid
+                valid_loss = sum_loss / n_valid
+
+                if best_valid_loss is None or valid_loss < best_valid_loss:
+                    best_epoch = epoch
+                    best_model = copy.deepcopy(self.model)
+                    best_valid_loss = valid_loss
+                    
+                log_dict = {
+                    'train_domain_discriminator_accuracy': train_acc,
+                    'train_domain_discriminator_loss':     train_loss,
+                    'valid_domain_discriminator_accuracy': valid_acc,
+                    'valid_domain_discriminator_loss':    valid_loss,
+                    'epoch': epoch,
+                    'best_epoch': best_epoch
+                }
+
+                print(log_dict)
                 
-            log_dict = {
-                'train_domain_discriminator_accuracy': train_acc,
-                'train_domain_discriminator_loss':     train_loss,
-                'valid_domain_discriminator_accuracy': valid_acc,
-                'valid_domain_discriminator_loss':    valid_loss,
-                'epoch': epoch,
-                'best_epoch': best_epoch
-            }
+                if self.use_wandb:
+                    wandb.log(log_dict)
 
-            print(log_dict)
+                scheduler.step()
 
-            scheduler.step()
-
-        # Preserve best model on test dataset
-        self.model = best_model
+            # Preserve best model on test dataset
+            self.model = best_model
+            
 
     def get_features(self, data):
         eval_probs_list =[]
